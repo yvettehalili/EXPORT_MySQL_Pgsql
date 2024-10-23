@@ -2,51 +2,55 @@ import settings as settings
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.errors import HttpError
 from googleapiclient import discovery
 from google.cloud import storage
-
+import os
 
 SECONDS_BETWEEN_OPERATION_STATUS_CHECKS = 10
+MAX_THREADS = int(os.getenv('MAX_THREADS', '3'))  # Allow setting via environment variable, default to 3
 _client = None
 
 settings.init()
 logger = settings._logger
 
+thread_local = threading.local()
+
+def get_storage_client():
+    if not hasattr(thread_local, "storage_client"):
+        thread_local.storage_client = storage.Client(credentials=settings.credentials)
+    return thread_local.storage_client
+
+def get_sqladmin_client():
+    if not hasattr(thread_local, "sqladmin_client"):
+        thread_local.sqladmin_client = discovery.build(
+            'sqladmin',
+            'v1beta4',
+            credentials=settings.credentials,
+            cache_discovery=False)
+    return thread_local.sqladmin_client
 
 class CloudSQL:
     @staticmethod
     def getfilesize(file_path, bucket_name):
-        # Initialize the storage client with the service account key
-        credentials = settings.credentials
-        client = storage.Client(credentials=credentials)
+        client = get_storage_client()
         file_size = 0
 
         try:
-            # Get the bucket
             bucket = client.get_bucket(bucket_name)
-
-            # Get the blob (file) from the bucket
             blob = bucket.blob(file_path)
-
-            # Fetch the metadata for the blob
             blob.reload()
-
-            # Get the file size in bytes
             file_size = blob.size
-        except:
+        except Exception as e:
             file_size = 0
+            logger.log_text(f"Error getting file size: {str(e)}")
 
         return file_size
 
     @staticmethod
     def getListOfCloudSQLS(project_id):
-        sqladmin = discovery.build(
-            "sqladmin",
-            "v1beta4",
-            cache_discovery=False,
-            credentials=settings.credentials,
-        )
+        sqladmin = get_sqladmin_client()
         request = sqladmin.instances().list(project=project_id)
         x = []
         while request is not None:
@@ -84,9 +88,7 @@ class CloudSQL:
 
     @staticmethod
     def getServerType(gcp_instance_name, project_id):
-        sqladmin = discovery.build(
-            "sqladmin", "v1beta4", cache_discovery=False, credentials=settings.credentials
-        )
+        sqladmin = get_sqladmin_client()
 
         req = sqladmin.instances().get(project=project_id, instance=gcp_instance_name)
         resp = req.execute()
@@ -134,24 +136,28 @@ class CloudSQL:
             response = request.execute()
             if "items" in response:
                 dbs = json.loads(json.dumps(response["items"]))
-                threads = []
-                for i in range(len(dbs)):
-                    data = dbs[i]
-                    if data["name"] not in [
-                        "mysql",
-                        "information_schema",
-                        "sys",
-                        "performance_schema",
-                    ]:
-                        thread = threading.Thread(
-                            target=CloudSQL.export_single_database,
-                            args=(data, project_id, instance_id, save_path, date_prefix, bucket_name),
+                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                    futures = [
+                        executor.submit(
+                            CloudSQL.export_single_database,
+                            data,
+                            project_id,
+                            instance_id,
+                            save_path,
+                            date_prefix,
+                            bucket_name,
                         )
-                        threads.append(thread)
-                        thread.start()
+                        for data in dbs if data["name"]
+                        not in ["mysql", "information_schema", "sys", "performance_schema"]
+                    ]
 
-                for thread in threads:
-                    thread.join()
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                            time.sleep(5)  # Introducing delay between operations
+                        except Exception as e:
+                            logger.log_text(f"Error in thread: {str(e)}")
+                            print(f"Error in thread: {str(e)}")
 
         except HttpError as e:
             print(e.resp.status)
@@ -161,14 +167,28 @@ class CloudSQL:
             print(e.errno)
 
     @staticmethod
-    def export_single_database(data, project_id, instance_id, save_path, date_prefix, bucket_name):
+    def export_single_database(
+        data, project_id, instance_id, save_path, date_prefix, bucket_name
+    ):
         export_uri = "gs://" + bucket_name + "/" + save_path + instance_id + "/"
         uri = export_uri + date_prefix + "_" + data["name"] + ".sql.gz"
         database = data["name"]
         print(f"Begin to export: {instance_id} database: {database}")
         content = CloudSQL._create_export_context(uri, db_name=data["name"])
         logger.log_text(f"Begin to Export: {instance_id}, database: {data['name']}")
-        CloudSQL.execute(export_context=content, project_id=project_id, instance_id=instance_id)
+
+        # Retry logic for execute
+        success = False
+        retries = 5
+        while not success and retries > 0:
+            try:
+                CloudSQL.execute(export_context=content, project_id=project_id, instance_id=instance_id)
+                success = True
+            except HttpError as err:
+                retries -= 1
+                print(f"Failed to export database: {format(err)}. Retrying in 10 seconds...")
+                logger.log_text(f"Failed to export database: {format(err)}. Retrying in 10 seconds...")
+                time.sleep(10)
 
         filepath = save_path + instance_id + "/" + date_prefix + "_" + data["name"] + ".sql.gz"
         filesize = CloudSQL.getfilesize(filepath, bucket_name)
@@ -202,7 +222,7 @@ class CloudSQL:
         except HttpError as err:
             print(f"Failed to export database: {format(err)}")
             logger.log_text(f"Failed to export database: {format(err)}")
-            return False
+            raise
 
     @staticmethod
     def wait_until_operation_finished(project_id, operation_id):
