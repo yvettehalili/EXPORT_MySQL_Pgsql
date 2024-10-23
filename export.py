@@ -1,4 +1,4 @@
-import src.settings as settings
+import settings as settings
 import json
 import time
 
@@ -13,12 +13,14 @@ _client = None
 settings.init()
 logger = settings._logger
 
+
+
 class CloudSQL:
     @staticmethod
     def getfilesize(file_path, bucket_name):
 
         # Initialize the storage client with the service account key
-        credentials = settings._credentials
+        credentials = settings.credentials
         client = storage.Client(credentials=credentials)
         file_size = 0
 
@@ -36,16 +38,114 @@ class CloudSQL:
             file_size = blob.size
         except:
             file_size = 0
-        
+
 
         return file_size
+
+    @staticmethod
+    def getListOfCloudSQLS(project_id):
+        sqladmin = discovery.build(
+            "sqladmin",
+            "v1beta4",
+            cache_discovery=False,
+            credentials=settings.credentials,
+        )
+        request = sqladmin.instances().list(project=project_id)
+        x=[]
+        while request is not None:
+            response = request.execute()
+
+            for database_instance in response["items"]:
+                # TODO: Change code below to process each `database_instance` resource:
+                ipAddress = json.loads(json.dumps(database_instance["ipAddresses"]))
+
+                if len(ipAddress) == 2:
+                    publicip = ipAddress[0]["ipAddress"]
+                    privateip = ipAddress[1]["ipAddress"]
+                elif len(ipAddress) == 1:
+                    publicip = ipAddress[0]["ipAddress"]
+                    privateip = ""
+                # pprint(database_instance, indent=2)
+                x.append(
+                    {
+                    "name" : database_instance["name"],
+                    "project" : database_instance["project"],
+                    "databaseInstalledVersion" : database_instance[
+                        "databaseInstalledVersion"
+                    ],
+                    "databaseInstalledVersion" : database_instance[
+                        "databaseInstalledVersion"
+                    ],
+                    "connectionName" : database_instance["connectionName"],
+                    "publicip" : publicip,
+                    "privateip" : privateip,
+                    "serviceAccountEmailAddress" : database_instance["serviceAccountEmailAddress"],
+                    "state" : database_instance["state"],
+                    }
+                )
+                # print(
+                #     database_instance["name"],
+                #     database_instance["project"],
+                #     database_instance["databaseInstalledVersion"],
+                #     database_instance["connectionName"],
+                #     publicip,
+                #     privateip,
+                #     database_instance["serviceAccountEmailAddress"],
+                #     database_instance["state"],
+                # )
+
+            request = sqladmin.instances().list_next(
+                previous_request=request, previous_response=response
+            )
+        pprint(x, indent=2)
+
+    @staticmethod
+    def getServerType(gcp_instance_name, project_id):
+        sqladmin = discovery.build("sqladmin", "v1beta4",
+                          cache_discovery=False, credentials=settings.credentials)
+
+        req = sqladmin.instances().get(project=project_id, instance=gcp_instance_name)
+        resp = req.execute()
+
+        resource = {}
+        if "databaseInstalledVersion" in resp:
+            version = json.loads(json.dumps(resp["databaseVersion"]))
+            ipAddress = json.loads(json.dumps(resp["ipAddresses"]))
+            connectioname = json.loads(json.dumps(resp["connectionName"]))
+
+            if len(ipAddress) == 2:
+                publicip = ipAddress[0]["ipAddress"]
+                privateip = ipAddress[1]["ipAddress"]
+            elif len(ipAddress) == 1:
+                publicip = ipAddress[0]["ipAddress"]
+                privateip = ""
+
+            resource = dict.fromkeys(
+                ["sqldata"],
+                [
+                    gcp_instance_name,
+                    project_id,
+                    connectioname,
+                    version,
+                    publicip,
+                    privateip,
+                ],
+            )
+
+        sqladmin.close()
+
+        return resource
+
 
     @staticmethod
     def export(project_id, instance_id, save_path, date_prefix, bucket_name):
         export_uri = 'gs://' + bucket_name + '/' + save_path + instance_id + '/'
         #settings.init()
         global _client
-        _client = discovery.build('sqladmin', 'v1beta4', credentials=settings._dbcredentials, cache_discovery=False)
+        _client = discovery.build('sqladmin',
+                        'v1beta4',
+                        credentials=settings.credentials,
+                        cache_discovery=False)
         try:
             request = _client.databases().list(project=project_id, instance=instance_id)
             response = request.execute()
@@ -58,13 +158,15 @@ class CloudSQL:
                         uri = export_uri + date_prefix + '_' + data['name'] + '.sql.gz'
                         database=data['name']
                         print(f'Begin to export:{instance_id} database:{database}')
-                        content = CloudSQL._create_export_context(uri, db_name=data['name']) 
+                        content = CloudSQL._create_export_context(uri, db_name=data['name'])
                         logger.log_text(
                             f"Begin to Export: {instance_id}, "
                             f"database: {data['name']}"
                         )
-                        CloudSQL.execute(export_context=content, project_id=project_id, instance_id=instance_id)
-                        
+                        CloudSQL.execute(export_context=content,
+                                project_id=project_id,
+                                instance_id=instance_id)
+
                         filepath = save_path + instance_id + '/' + date_prefix + '_' + data['name'] + '.sql.gz'
 
                         filesize = CloudSQL.getfilesize(filepath, bucket_name)
@@ -89,7 +191,7 @@ class CloudSQL:
             'exportContext': {
                 'kind': 'sql#exportContext',
                 'fileType': 'SQL',
-                'offload': False,
+                'offload': True,
                 'uri': export_uri,
                 'databases': [db_name]
             }
@@ -114,7 +216,7 @@ class CloudSQL:
         operation_id = response['name']
 
         operation_success = CloudSQL.wait_until_operation_finished(project_id, operation_id)
-        
+
     def wait_until_operation_finished(project_id, operation_id):
         operation_in_progress = True
         operation_success = False
